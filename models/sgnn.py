@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import logging
+from pathlib import Path
+
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -12,6 +15,32 @@ from snntorch import surrogate
 
 from ..graph_builder.graph_builder import SrcDstGraph
 from ..graph_builder.graph_custom_data import GraphCustomData
+
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+if not logger.handlers:
+    _h = logging.StreamHandler()
+    _h.setFormatter(logging.Formatter("%(message)s"))
+    logger.addHandler(_h)
+    logger.propagate = False
+
+
+def log_parameter_grad_norm(model: nn.Module, epoch_index: int, num_epochs: int) -> None:
+    """
+    Compute total L2 norm of all parameter gradients (after ``backward``, before ``step``)
+    and log it (``StreamHandler`` on this logger so INFO shows in Jupyter). Uses:
+
+    ``grads = [p.grad.detach().flatten() for p in model.parameters() if p.grad is not None]``,
+    ``total_norm = torch.cat(grads).norm()`` (when ``grads`` is non-empty).
+    """
+    grads = [p.grad.detach().flatten() for p in model.parameters() if p.grad is not None]
+    if not grads:
+        dev = next(model.parameters()).device
+        total_norm = torch.tensor(0.0, device=dev)
+    else:
+        total_norm = torch.cat(grads).norm()
+    msg = f"[epoch {epoch_index + 1}/{num_epochs}] total_grad_norm={float(total_norm):.6f}"
+    logger.info(msg)
 
 
 class BasicSGNNClassifier(nn.Module):
@@ -31,7 +60,9 @@ class BasicSGNNClassifier(nn.Module):
     Each LIF block runs ``num_steps`` micro-steps; the **mean spike rate** is passed
     to the next linear layer.
 
-    Forward: ``(x, edge_index, batch)`` → logits ``[num_graphs, num_classes]``.
+    Forward: ``(x, edge_index, batch, graph_build=...)`` → logits ``[num_graphs, num_classes]``.
+    Pass ``graph_build`` for per-sample :class:`~sgnn.graph_builder.graph_builder.SrcDstGraph`
+    when training on ``graph_ls``; otherwise ``self.G`` is used.
     """
 
     def __init__(
@@ -163,7 +194,10 @@ class BasicSGNNClassifier(nn.Module):
         x: torch.Tensor,
         edge_index: torch.Tensor,
         batch: torch.Tensor,
+        *,
+        graph_build: SrcDstGraph | None = None,
     ) -> torch.Tensor:
+        G = graph_build if graph_build is not None else self.G
         x = self.conv1(x, edge_index)
         if self.conv2 is not None:
             x = F.relu(x)
@@ -179,9 +213,36 @@ class BasicSGNNClassifier(nn.Module):
             x = self.conv4(x, edge_index)
 
         data = GraphCustomData(x=x, edge_index=edge_index)
-        x = data.time_chunk_x(self.G)
+        x = data.time_chunk_x(G)
 
         x = self._node_blur(x, batch)
         x = torch.flatten(x, start_dim=1)
         return self._classifier_forward(x)
+
+    def load_saved_weights(
+        self,
+        optimizer_name: str,
+        *,
+        weights_dir: str | Path | None = None,
+        map_location: str | torch.device | None = None,
+        strict: bool = True,
+    ) -> Path:
+        """
+        Load weights saved by the notebook naming convention:
+        ``sgnn_<optimizer>_weights.pt``.
+
+        If ``weights_dir`` is not provided, defaults to ``sgnn/saved_weights``.
+        """
+        base_dir = (
+            Path(weights_dir)
+            if weights_dir is not None
+            else Path(__file__).resolve().parents[1] / "saved_weights"
+        )
+        weight_path = base_dir / f"sgnn_{optimizer_name.lower()}_weights.pt"
+        if not weight_path.exists():
+            raise FileNotFoundError(f"SGNN weights not found: {weight_path}")
+
+        state = torch.load(weight_path, map_location=map_location)
+        self.load_state_dict(state, strict=strict)
+        return weight_path
 
